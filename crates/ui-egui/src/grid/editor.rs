@@ -74,12 +74,21 @@ pub(super) fn in_cell_editor(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, s
     painter.rect_filled(erect, 0.0, fill);
     painter.rect_stroke(erect.expand(1.0), 0.0, Stroke::new(2.0, Tokens::get(ui.ctx()).sel_border), StrokeKind::Middle);
     let id = egui::Id::unique("gridcraft.cell_editor");
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(erect.shrink2(vec2(2.0, 1.0))));
+    // A one-line edit keeps the text where the cell draws it (its vertical alignment, insets and the
+    // font's line gap), so entering edit mode doesn't make the text jump.
+    let field = if !wrap && lines <= 1.0 {
+        let gh = ui.painter().layout_no_wrap(ed.text.clone(), font.clone(), Color32::BLACK).size().y;
+        let top = super::cell_paint::cell_text_y(st.align.v, rect, gh, geo.z) + crate::fonts::line_gap(&font);
+        Rect::from_min_max(pos2(erect.left() + 2.0, top), pos2(erect.right() - 2.0, (erect.bottom() - 1.0).max(top + gh)))
+    } else {
+        erect.shrink2(vec2(2.0, 1.0))
+    };
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field));
     child.set_clip_rect(clip);
     // The theme's caret is meant for the UI chrome and vanishes on some fills (and, in the dark
     // theme, on the white paper): pick black or white against the fill, like Excel.
     child.visuals_mut().text_cursor.stroke.color = ink_on(fill);
-    crate::formula_bar::editor_widget(app, &mut child, id, font, wrap, erect.width() - 4.0, erect.height() - 2.0);
+    crate::formula_bar::editor_widget(app, &mut child, id, font, wrap, field.width(), field.height());
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.rect"), erect));
 }
 

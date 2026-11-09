@@ -19,6 +19,24 @@ use std::sync::OnceLock;
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_FONT_FILE: u64 = 64 << 20;
 
+/// Reads a font file of at most [`MAX_FONT_FILE`] bytes, even when it grows after it was found.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn read_font(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_FONT_FILE {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FONT_FILE + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= MAX_FONT_FILE).then_some(bytes)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn read_font(_path: &std::path::Path) -> Option<Vec<u8>> {
+    None
+}
+
 /// A face keeps at most this many family names, so a hostile `name` table can't grow the catalog.
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_FAMILY_NAMES: usize = 16;
@@ -172,7 +190,7 @@ pub fn scan_dirs(dirs: &[PathBuf]) -> Vec<Face> {
             if !is_font || std::fs::metadata(&path).map(|m| m.len() > MAX_FONT_FILE).unwrap_or(true) {
                 continue;
             }
-            let Ok(data) = std::fs::read(&path) else { continue };
+            let Some(data) = read_font(&path) else { continue };
             for (index, family, names, style) in file_faces(&data) {
                 out.push(Face { family, names, path: path.clone(), index, weight: style_weight(&style), italic: style_italic(&style) });
             }
@@ -199,15 +217,20 @@ fn catalog_now() -> Option<&'static [Face]> {
 }
 
 /// Start cataloging the installed fonts on a background thread, so the first frame doesn't wait for
-/// it. A no-op on wasm and after the scan has started.
-pub fn start_scan() {
+/// it. A no-op on wasm and after the scan has started. When the scan finishes it asks `ctx` for a
+/// repaint, so an idle window binds the workbook's fonts without waiting for input.
+pub fn start_scan(ctx: &egui::Context) {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
+        #[cfg(target_arch = "wasm32")]
+        let _ = ctx;
         #[cfg(not(target_arch = "wasm32"))]
         if CATALOG.get().is_none() {
+            let ctx = ctx.clone();
             // A failed spawn leaves the scan to the first blocking lookup.
-            let _ = std::thread::Builder::new().name("font-scan".into()).spawn(|| {
+            let _ = std::thread::Builder::new().name("font-scan".into()).spawn(move || {
                 catalog();
+                ctx.request_repaint();
             });
         }
     });
@@ -283,6 +306,12 @@ pub fn families() -> Vec<String> {
     out
 }
 
+/// Hinting for cell fonts: the font's own instructions, fitted horizontally as well, so stems land
+/// on whole pixels the way Windows draws them at small sizes.
+pub(crate) fn crisp_hinting() -> egui::epaint::text::HintingTarget {
+    egui::epaint::text::HintingTarget::Mono
+}
+
 /// The egui family name for one role of one family: `fnt:{family}:{b|n}{i|n}`.
 pub fn role_key(family: &str, bold: bool, italic: bool) -> String {
     format!("fnt:{family}:{}{}", if bold { 'b' } else { 'n' }, if italic { 'i' } else { 'n' })
@@ -335,9 +364,10 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
                 continue;
             }
             if !fonts.font_data.contains_key(&key) {
-                let Ok(bytes) = std::fs::read(&face.path) else { continue };
+                let Some(bytes) = read_font(&face.path) else { continue };
                 let mut fd = egui::FontData::from_owned(bytes);
                 fd.index = face.index;
+                fd.tweak.hinting_target = crisp_hinting();
                 fonts.font_data.insert(key.clone(), std::sync::Arc::new(fd));
             }
             chain.push(key);
@@ -347,15 +377,12 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
         }
         chain.extend(base.iter().cloned());
         let role = role_key(family, bold, italic);
+        let first = chain.first().and_then(|key| fonts.font_data.get(key));
+        record_line_gap(&role, first.map_or(0.0, |fd| crate::theme::line_gap_share(fd)));
         fonts.families.insert(egui::FontFamily::Name(role.clone().into()), chain);
         bound.push(role);
     }
     bound
-}
-
-/// Bind every installed face of `family`, found by any of its names (see [`bind_faces`]).
-pub fn bind_family(fonts: &mut egui::FontDefinitions, family: &str) -> Vec<String> {
-    bind_faces(fonts, family, &faces_of(family))
 }
 
 /// The role families currently bound to font data. `cell_family` consults this, so it never names a
@@ -369,6 +396,25 @@ fn bound() -> &'static std::sync::RwLock<HashSet<String>> {
 /// Record the role families a freshly built [`egui::FontDefinitions`] bound.
 pub fn set_bound(keys: impl IntoIterator<Item = String>) {
     *bound().write().unwrap_or_else(std::sync::PoisonError::into_inner) = keys.into_iter().collect();
+}
+
+fn line_gaps() -> &'static std::sync::RwLock<std::collections::HashMap<String, f32>> {
+    static GAPS: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<String, f32>>> = std::sync::OnceLock::new();
+    GAPS.get_or_init(Default::default)
+}
+
+/// Notes a cell font's line gap, as a share of its size.
+pub(crate) fn record_line_gap(role: &str, share: f32) {
+    line_gaps().write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(role.to_string(), share);
+}
+
+/// How far down a cell's text goes for its font's line gap, which Excel draws above the text and egui
+/// below. Measured against Excel with Calibri, whose gap is 22% of its size. Applied where cells are
+/// drawn rather than on the font: a cell's fallback glyphs must stay on its line, and interface text
+/// that falls back to a cell font must not move.
+pub(crate) fn line_gap(font: &egui::FontId) -> f32 {
+    let egui::FontFamily::Name(role) = &font.family else { return 0.0 };
+    line_gaps().read().unwrap_or_else(std::sync::PoisonError::into_inner).get(role.as_ref()).copied().unwrap_or(0.0) * font.size
 }
 
 /// Is this exact role family bound to font data?
@@ -472,6 +518,8 @@ mod tests {
         }
         // A family with no faces binds nothing and never touches the map.
         assert!(bind_faces(&mut fonts, "No Such Font", &[]).is_empty());
+        std::fs::File::create(&face.path).expect("sparse file").set_len(MAX_FONT_FILE + 1).expect("oversized file");
+        assert!(read_font(&face.path).is_none(), "an oversized font is not read");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

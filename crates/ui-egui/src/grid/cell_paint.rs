@@ -59,6 +59,9 @@ pub(super) fn look(wb: &Workbook, si: usize, sh: &Sheet, c: CellRef, cf: &mut Cf
         if st.num_fmt.as_str() != "General" {
             style.num_fmt = st.num_fmt.clone();
         }
+        if st.align.reading_order.is_some() {
+            style.align.reading_order = st.align.reading_order;
+        }
         for (dst, src) in [
             (&mut style.borders.left, st.borders.left),
             (&mut style.borders.right, st.borders.right),
@@ -142,10 +145,17 @@ pub(crate) fn wrapped_cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32) -
     }
 }
 
+/// Inset of single-line top- and bottom-aligned text from the cell edge, in sheet pixels at 100%
+/// zoom: the line box as Excel places it, measured with Calibri, a pixel in from the row's edge, top
+/// or bottom. In a row too short for it the two simply overlap, so each keeps its side and the cell
+/// clips the rest. The caller adds the font's line gap (`fonts::line_gap`), which Excel has above the
+/// text. Callers multiply by the sheet zoom.
+pub(crate) const LINE_EDGE_INSET: f32 = 1.0;
+
 pub(crate) fn cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32) -> f32 {
-    let top_inset = 1.0 * z;
-    let y_top = rect.top() - top_inset;
-    let y_bottom = (rect.bottom() - gh - 0.5 * z).max(y_top);
+    let inset = LINE_EDGE_INSET * z;
+    let y_top = rect.top() + inset;
+    let y_bottom = rect.bottom() - gh - inset;
     match valign {
         VAlign::Top => y_top,
         VAlign::Center | VAlign::Justify | VAlign::Distributed => (y_top + y_bottom) / 2.0,
@@ -227,6 +237,30 @@ pub(super) fn shrink_font(p: &Painter, text: &str, font: &FontId, room: f32) -> 
     Some(FontId::new(size, font.family.clone()))
 }
 
+/// A horizontal or vertical line a whole number of physical pixels wide, on the pixel grid, at the
+/// cell edge between `a` and `b`: one pixel sits just before the edge, as a gridline's does, and a
+/// wider line grows across it. Returns false for a slanted line, which it leaves to the caller.
+pub(crate) fn crisp_line(p: &Painter, a: Pos2, b: Pos2, pixels: f32, col: Color32) -> bool {
+    let ppp = p.ctx().pixels_per_point();
+    let horizontal = (a.y - b.y).abs() < 0.01;
+    if !horizontal && (a.x - b.x).abs() >= 0.01 {
+        return false;
+    }
+    let across = |v: f32| {
+        let start = (v * ppp).round() - (pixels / 2.0).ceil();
+        (start + pixels / 2.0) / ppp
+    };
+    let stroke = Stroke::new(pixels / ppp, col);
+    if horizontal {
+        let y = across(a.y);
+        p.line_segment([pos2(a.x, y), pos2(b.x, y)], stroke);
+    } else {
+        let x = across(a.x);
+        p.line_segment([pos2(x, a.y), pos2(x, b.y)], stroke);
+    }
+    true
+}
+
 pub(crate) fn paint_border(p: &Painter, pts: [Pos2; 2], style: BorderStyle, col: Color32) {
     let w = style.width();
     let (a, b) = (pts[0], pts[1]);
@@ -250,7 +284,10 @@ pub(crate) fn paint_border(p: &Painter, pts: [Pos2; 2], style: BorderStyle, col:
             p.extend(egui::Shape::dotted_line(&[a, b], col, 2.0, w * 0.5));
         }
         _ => {
-            p.line_segment([a, b], Stroke::new(w, col));
+            // Thin, medium and thick are 1, 2 and 3 pixels wide in Excel at any zoom.
+            if !crisp_line(p, a, b, w.round().max(1.0), col) {
+                p.line_segment([a, b], Stroke::new(w, col));
+            }
         }
     }
 }

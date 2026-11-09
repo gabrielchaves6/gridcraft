@@ -93,12 +93,14 @@ impl SheetApp {
     ///
     /// [`logic`]: SheetApp::logic
     pub fn setup_context(ctx: &egui::Context, dark: bool) {
-        crate::fonts::start_scan();
         Self::setup_context_for_language(ctx, dark, i18n::Language::En);
     }
 
-    /// Sets up fonts and visuals for a specific persisted interface language.
+    /// Sets up fonts and visuals for a specific persisted interface language. Starts the installed
+    /// font scan too (once; a no-op on wasm): without it workbook fonts are never bound and every
+    /// cell font falls back to the built-in roles.
     pub fn setup_context_for_language(ctx: &egui::Context, dark: bool, language: i18n::Language) {
+        crate::fonts::start_scan(ctx);
         ctx.set_fonts(theme::font_definitions_for_language(language));
         theme::apply(ctx, dark);
     }
